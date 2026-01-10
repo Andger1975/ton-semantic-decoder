@@ -1,7 +1,7 @@
 """
-💎 TON Semantic Decoder
+💎 TON Semantic Decoder v2.0
 Open-source module for parsing TON events with hardened security checks.
-Part of the TonWise Security Suite.
+Updated for raw addresses, body/bin payloads, and extended OpCodes.
 """
 
 import base64
@@ -12,18 +12,23 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 # --- CONFIGURATION ---
 
-# Known OpCodes (Human Readable)
+# Extended OpCodes (Human Readable)
 OPCODES = {
     0x00000000: "💬 Text Comment",
-    0xf8a7ea5: "💸 Jetton Transfer",
+    0x0f8a7ea5: "💸 Jetton Transfer",
     0x178d4519: "💳 Jetton Internal Transfer",
+    0x595f07bc: "🔥 Jetton Burn",
+    0x7362d09c: "🔔 Jetton Notify",
     0x5fcc3d14: "🖼 NFT Transfer",
     0x05138d91: "💎 SFX Deposit",
-    0xd53276db: "🔙 Excesses (Cashback)"
+    0xd53276db: "🔙 Excesses (Cashback)",
+    0xea06185d: "🔄 Swap (Ston.fi/DeDust)",
+    0x4776d575: "💰 Stake Deposit"
 }
 
-# Strict TON Address Regex (Base64url, 48 chars)
-TON_ADDRESS_REGEX = re.compile(r'^[a-zA-Z0-9_-]{48}$')
+# Improved Regex: Supports Friendly (48 chars) AND Raw (0:hex...)
+# Raw address: workchain_id (usually 0 or -1) followed by ":" and 64 hex chars
+TON_ADDRESS_REGEX = re.compile(r'^([a-zA-Z0-9_-]{48}|-?1:[a-fA-F0-9]{64})$')
 
 
 class TonDecoder:
@@ -37,34 +42,22 @@ class TonDecoder:
         """
         🛡 Hardened Anti-Phishing Defang.
         Protects against IDN homographs, clickable links, and scheme obfuscation.
-        Example: "https://evil.com" -> "hxxps://evil[.]com"
         """
         if not text: return ""
 
-        # 1. Unicode Normalization (Prevents homograph attacks)
+        # 1. Unicode Normalization
         text = unicodedata.normalize('NFKC', text)
 
         # 2. Break Protocols
         text = text.replace("http:", "hxxp:").replace("https:", "hxxps:")
 
-        # 3. Break Domains (Defang dots)
+        # 3. Break Domains (Defang dots inside words to prevent clickable links)
         text = re.sub(r'([a-zA-Z0-9а-яА-ЯёЁ_-]+\.[a-zA-Z0-9а-яА-ЯёЁ_-]+)', r'[.]\1', text)
 
         return text
 
     @staticmethod
     def decode_base64_comment(b64_str: str) -> str:
-        """
-        Decodes a Base64-encoded string to its original string form. If the input string is
-        invalid or cannot be decoded, it returns a placeholder indicating binary data. Empty
-        input strings are handled and return an empty string.
-
-        :param b64_str: A Base64-encoded string to decode.
-        :type b64_str: str
-        :return: The decoded string if successful, an empty string for empty input, or
-            a placeholder "<binary_data>" for invalid input.
-        :rtype: str
-        """
         try:
             if not b64_str: return ""
             return base64.b64decode(b64_str).decode('utf-8', errors='ignore').strip()
@@ -75,7 +68,7 @@ class TonDecoder:
     def parse_ton_link(cls, link: str) -> dict:
         """
         Parses ton:// links with security checks.
-        Detects: Amount, Comment, Destination, and Binary Payloads.
+        Detects: Amount, Comment, Destination, and Binary Payloads (bin OR body).
         """
         result = {
             "valid": False,
@@ -83,6 +76,7 @@ class TonDecoder:
             "amount": 0.0,
             "comment": None,
             "has_payload": False,
+            "payload_type": None,
             "warning": None
         }
 
@@ -92,12 +86,13 @@ class TonDecoder:
             # --- 1. SANITIZATION ---
             clean_link = unquote(link)
             clean_link = unicodedata.normalize('NFKC', clean_link)
-            # Remove invisible control characters
             clean_link = re.sub(r'[\x00-\x1f\s]+', '', clean_link)
 
-            # Support for Tonkeeper links
+            # Support for Tonkeeper/Tonhub web links
             if "tonkeeper.com/transfer/" in clean_link:
                 clean_link = clean_link.replace("https://tonkeeper.com/transfer/", "ton://transfer/")
+            elif "app.tonkeeper.com/transfer/" in clean_link:
+                clean_link = clean_link.replace("https://app.tonkeeper.com/transfer/", "ton://transfer/")
 
             # --- 2. INTENT DETECTION ---
             lower_link = clean_link.lower()
@@ -110,9 +105,10 @@ class TonDecoder:
             # --- 3. ADDRESS EXTRACTION ---
             address_part = tail.split('?')[0].replace('/', '')
 
-            # Strict Regex Validation
+            # Strict Regex Validation (Updated for Raw addresses)
             if not TON_ADDRESS_REGEX.match(address_part):
-                found = TON_ADDRESS_REGEX.search(address_part)
+                # Try to extract loosely if strict match fails
+                found = re.search(r'[a-zA-Z0-9_-]{48}|-?1:[a-fA-F0-9]{64}', address_part)
                 if found:
                     address_part = found.group(0)
                     result["warning"] = "⚠️ Non-standard URL structure detected"
@@ -129,18 +125,31 @@ class TonDecoder:
 
             if 'amount' in qs:
                 try:
-                    result["amount"] = int(qs['amount'][-1]) / 1_000_000_000
+                    # Handle decimals or integers
+                    val = qs['amount'][-1]
+                    result["amount"] = float(val) / 1_000_000_000 if '.' not in val else float(val)
                 except:
                     pass
 
             if 'text' in qs:
                 result["comment"] = cls.defang_url(qs['text'][-1])
 
-            # --- 5. PAYLOAD DETECTION (Lite Version) ---
-            # We detect IF there is a payload, but don't emulate it (requires C++ TVM)
-            if 'bin' in qs:
+            # --- 5. PAYLOAD DETECTION (HARDENED) ---
+            # Checks for 'bin', 'body' (alias), and 'init' (state init)
+
+            payload_bin = qs.get('bin') or qs.get('body')
+            state_init = qs.get('init')
+
+            if payload_bin:
                 result["has_payload"] = True
+                result["payload_type"] = "Contract Call"
                 result["warning"] = "⚠️ Binary Payload Detected (Potential Smart Contract Call)"
+
+            if state_init:
+                # If there is also a payload, upgrade warning
+                prefix = "⚠️ " if not result["warning"] else result["warning"] + " + "
+                result["warning"] = prefix + "State Init Detected (Deploying Contract)"
+                result["has_payload"] = True
 
         except Exception as e:
             result["warning"] = f"Parser Error: {str(e)}"
@@ -148,7 +157,7 @@ class TonDecoder:
         return result
 
     @classmethod
-    def parse_event(cls, event_data: dict, my_wallet: str = None) -> dict:
+    def parse_event(cls, event_data: dict) -> dict:
         """
         Parses raw TonAPI events into human-readable format.
         """
@@ -166,30 +175,45 @@ class TonDecoder:
                 result["action"] = "💰 TON Transfer"
                 result["description"] = f"Msg: {cls.defang_url(comment)}" if comment else "Direct Transfer"
 
-                # Simple Heuristic Check
-                if comment and any(x in comment.lower() for x in ['claim', 'gift', 'airdrop']):
-                    result["scam_risk"] = True
+                # Check for scam claims
+                if comment:
+                    bad_words = ['claim', 'gift', 'airdrop', 'verify', 'reward']
+                    if any(w in comment.lower() for w in bad_words):
+                        result["scam_risk"] = True
 
             elif type_ == "JettonTransfer":
                 jt = primary.get("JettonTransfer", {})
-                sym = jt.get("jetton", {}).get("symbol", "TOKEN")
-                decimals = jt.get("jetton", {}).get("decimals", 9)
-                amt = float(jt.get("amount", 0)) / (10 ** decimals)
+                jetton = jt.get("jetton", {})
+                sym = jetton.get("symbol", "TOKEN")
+                decimals = jetton.get("decimals", 9)
+
+                try:
+                    amt = float(jt.get("amount", 0)) / (10 ** decimals)
+                except:
+                    amt = 0
 
                 result["action"] = f"💸 {sym} Transfer"
                 result["description"] = f"Volume: {amt:,.2f} {sym}"
 
-                # Scam markers
-                if "usdt" in sym.lower() and "ton" in sym.lower():  # Fake USDT-TON tokens
+                # Heuristic: SCAM jettons often have URL-like names or "Voucher"
+                name_lower = jetton.get("name", "").lower()
+                if "ton" in name_lower and "usdt" in name_lower and sym != "USDT":
+                    result["scam_risk"] = True  # Fake USDT
+                if ".com" in name_lower or "voucher" in name_lower:
                     result["scam_risk"] = True
 
             elif type_ == "SmartContractExec":
-                op = primary.get("SmartContractExec", {}).get("operation", "Unknown")
-                op_name = OPCODES.get(0, "Contract Call")  # Default
-                # Note: Full OpCode parsing requires Hex conversion logic
-                result["action"] = f"⚙️ {op_name}"
-                result["description"] = f"Op: {op}"
+                exec_data = primary.get("SmartContractExec", {})
+                # Try to parse OpCode from payload if operation name is generic
+                op_name = exec_data.get("operation", "Unknown")
 
-        except Exception:
+                # Basic HEX OpCode extraction logic could go here if payload is available
+                # For now, we rely on TonAPI's parsed operation
+
+                result["action"] = f"⚙️ Contract Exec"
+                result["description"] = f"Method: {op_name}"
+
+        except Exception as e:
+            logging.error(f"Event parsing failed: {e}")
             pass
         return result
