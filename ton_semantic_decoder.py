@@ -1,5 +1,5 @@
 """
-💎 TON Semantic Decoder v2.0
+💎 TON Semantic Decoder v2.1
 Open-source module for parsing TON events with hardened security checks.
 Updated for raw addresses, body/bin payloads, and extended OpCodes.
 """
@@ -25,6 +25,30 @@ OPCODES = {
     0xea06185d: "🔄 Swap (Ston.fi/DeDust)",
     0x4776d575: "💰 Stake Deposit"
 }
+
+# Known legit token symbols to protect against spoofing
+PROTECTED_SYMBOLS = {"USDT", "TON", "USDC", "BTC", "ETH", "NOT", "DOGS", "USDE", "jUSDT", "stTON"}
+
+# Invisible / zero-width unicode ranges that scammers use
+_INVISIBLE_RANGES = [
+    (0x0000, 0x0008), (0x000B, 0x000C), (0x000E, 0x001F),
+    (0x007F, 0x009F), (0x00AD, 0x00AD),
+    (0x115F, 0x115F), (0x1160, 0x1160),  # Hangul Jamo fillers (common in TON spoofs)
+    (0x200B, 0x200F), (0x2028, 0x202F), (0x2060, 0x206F),
+    (0xFEFF, 0xFEFF), (0xFFF0, 0xFFFB),
+    (0x1BC9D, 0x1BC9E),  # Duployan Shorthand fillers
+    (0xE0000, 0xE0FFF),  # Tag characters
+]
+
+def _has_invisible_chars(text: str) -> bool:
+    """Returns True if text contains invisible / zero-width unicode characters."""
+    for ch in text:
+        cp = ord(ch)
+        for lo, hi in _INVISIBLE_RANGES:
+            if lo <= cp <= hi:
+                return True
+    return False
+
 
 # Improved Regex: Supports Friendly (48 chars) AND Raw (0:hex...)
 # Raw address: workchain_id (usually 0 or -1) followed by ":" and 64 hex chars
@@ -217,3 +241,100 @@ class TonDecoder:
             logging.error(f"Event parsing failed: {e}")
             pass
         return result
+    @staticmethod
+    def detect_unicode_spoof(symbol: str) -> dict:
+        """
+        🔤 Detects Unicode spoof tokens that impersonate known assets.
+
+        Scammers use invisible Hangul Jamo, zero-width spaces and tag characters
+        to create tokens that look identical to USDT/TON/ETH in most wallets.
+
+        Returns:
+            {
+                "is_spoof": bool,
+                "spoof_of": str | None,   # e.g. "USDT"
+                "has_invisible": bool,
+                "cleaned": str            # symbol with invisible chars stripped
+            }
+
+        Example:
+            >>> TonDecoder.detect_unicode_spoof("USDTᅟᅟ")
+            {"is_spoof": True, "spoof_of": "USDT", "has_invisible": True, "cleaned": "USDT"}
+        """
+        import unicodedata
+        from difflib import SequenceMatcher
+
+        has_invisible = _has_invisible_chars(symbol)
+
+        # Strip invisible chars to get the "cleaned" version
+        cleaned = unicodedata.normalize('NFKC', symbol)
+        cleaned = ''.join(
+            ch for ch in cleaned
+            if not _has_invisible_chars(ch) and unicodedata.category(ch) not in ('Cf', 'Cn', 'Cs')
+        ).strip()
+
+        # Check exact match after cleaning (most common case)
+        if cleaned.upper() in PROTECTED_SYMBOLS and (cleaned != symbol or has_invisible):
+            return {"is_spoof": True, "spoof_of": cleaned.upper(), "has_invisible": has_invisible, "cleaned": cleaned}
+
+        # Fuzzy match for near-identical names (e.g. "USDT" with lookalike chars)
+        for protected in PROTECTED_SYMBOLS:
+            similarity = SequenceMatcher(None, cleaned.upper(), protected).ratio()
+            if similarity >= 0.92 and cleaned.upper() != protected:
+                return {"is_spoof": True, "spoof_of": protected, "has_invisible": has_invisible, "cleaned": cleaned}
+
+        return {"is_spoof": False, "spoof_of": None, "has_invisible": has_invisible, "cleaned": cleaned}
+
+    @staticmethod
+    def decode_opcode(hex_payload: str) -> dict:
+        """
+        ⚙️ Decodes a raw hex/base64 payload and returns the OpCode description.
+
+        Handles both hex strings (0x...) and base64-encoded cell bodies.
+
+        Returns:
+            {
+                "opcode_hex": str,
+                "opcode_int": int,
+                "description": str,
+                "known": bool
+            }
+
+        Example:
+            >>> TonDecoder.decode_opcode("0f8a7ea5")
+            {"opcode_hex": "0f8a7ea5", "opcode_int": 260734629, "description": "💸 Jetton Transfer", "known": True}
+        """
+        opcode_int = None
+        opcode_hex = None
+
+        try:
+            clean = hex_payload.strip().lower().replace('0x', '')
+
+            # Try direct hex first
+            if re.fullmatch(r'[0-9a-f]+', clean) and len(clean) >= 8:
+                opcode_hex = clean[:8]
+                opcode_int = int(opcode_hex, 16)
+            else:
+                # Try base64 decode and read first 4 bytes
+                try:
+                    raw = base64.urlsafe_b64decode(
+                        hex_payload + '=' * (4 - len(hex_payload) % 4)
+                    )
+                    if len(raw) >= 4:
+                        opcode_int = int.from_bytes(raw[:4], 'big')
+                        opcode_hex = f"{opcode_int:08x}"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if opcode_int is None:
+            return {"opcode_hex": None, "opcode_int": None, "description": "Unknown", "known": False}
+
+        description = OPCODES.get(opcode_int, f"Unknown OpCode (0x{opcode_hex})")
+        return {
+            "opcode_hex": opcode_hex,
+            "opcode_int": opcode_int,
+            "description": description,
+            "known": opcode_int in OPCODES
+        }
